@@ -1,92 +1,118 @@
-import { extractTextFromBuffer } from "../services/pdf.service.js";
-import { llamaClient } from "../config/groq.js";
+import Groq from "groq-sdk";
+import { extractLicenseText } from "../services/license.file.service.js";
 
+// ============================================================
+// Lazy Groq client — same pattern as passport controller
+// ============================================================
+let groqClient = null;
+const getGroqClient = () => {
+    if (!groqClient) {
+        if (!process.env.GROQ_API_KEY) {
+            throw new Error("GROQ_API_KEY is missing from environment variables.");
+        }
+        groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    }
+    return groqClient;
+};
+
+// ============================================================
+// Regex safety net — fix common OCR mistakes on licenses
+// ============================================================
+const applyLicenseRegexFixes = (data, rawText) => {
+    // Fix license number: remove spaces/noise
+    if (data.LICENSE_NUMBER) {
+        data.LICENSE_NUMBER = data.LICENSE_NUMBER.toUpperCase().replace(/\s+/g, "").replace(/[^A-Z0-9]/g, "");
+    }
+
+    // Fix dates: normalize to DD/MM/YYYY
+    const normDate = (val) => {
+        if (!val) return null;
+        // Already DD/MM/YYYY
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(val)) return val;
+        // YYYY-MM-DD → DD/MM/YYYY
+        const iso = val.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+        // DD-MM-YYYY → DD/MM/YYYY
+        const dmy = val.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (dmy) return `${dmy[1]}/${dmy[2]}/${dmy[3]}`;
+        return val;
+    };
+
+    data.DATE_OF_BIRTH = normDate(data.DATE_OF_BIRTH);
+    data.ISSUE_DATE    = normDate(data.ISSUE_DATE);
+    data.EXPIRY_DATE   = normDate(data.EXPIRY_DATE);
+
+    // Extract license number from raw text if LLM missed it
+    if (!data.LICENSE_NUMBER) {
+        // Indian DL format: XX00 YYYYNNNNNNN
+        const dlMatch = rawText.match(/[A-Z]{2}\d{2}\s?\d{4}\d{7}/);
+        if (dlMatch) data.LICENSE_NUMBER = dlMatch[0].replace(/\s/g, "");
+    }
+
+    // Extract PLACE_OF_ISSUE if missing
+    if (!data.ISSUING_AUTHORITY) {
+        const rtoMatch = rawText.match(/(?:RTO|Licencing Authority|Issuing Authority)[:\s]+([A-Z\s,]+)/i);
+        if (rtoMatch) data.ISSUING_AUTHORITY = rtoMatch[1].trim();
+    }
+
+    return data;
+};
+
+// ============================================================
+// MAIN CONTROLLER
+// ============================================================
 export const analyzeLicense = async (req, res) => {
+    console.log("📥 License request received:", req.file?.originalname);
+
     try {
         if (!req.file) {
             return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const buffer = req.file.buffer;
+        const groq = getGroqClient();
 
-        const pdfText = await extractTextFromBuffer(buffer);
-        console.log(pdfText);
+        // Extract text (handles PDF + image + rotation)
+        const rawText = await extractLicenseText(req.file);
+        if (!rawText) {
+            return res.status(500).json({ error: "OCR returned empty text" });
+        }
 
-        const response = await llamaClient.chat.completions.create({
+        // LLM extraction
+        const response = await groq.chat.completions.create({
             model: "llama-3.3-70b-versatile",
             temperature: 0,
             messages: [
                 {
                     role: "system",
-                    content: "You extract structured data from driving licenses."
+                    content: `You are a Driving License OCR expert. Return data ONLY as a JSON object.
+Fields: NAME, LICENSE_NUMBER, DATE_OF_BIRTH, ISSUE_DATE, EXPIRY_DATE, ADDRESS, VEHICLE_CLASS, ISSUING_AUTHORITY.
+Rules:
+- Dates must be DD/MM/YYYY format.
+- NAME: only the license holder's name — never include father/husband name or S/O, W/O, D/O prefixes.
+- LICENSE_NUMBER: alphanumeric only, no spaces.
+- VEHICLE_CLASS: list all vehicle classes authorized (e.g. "LMV, MCWG").
+- ADDRESS: full address block, prefer permanent address if both present.
+- If a field is missing, return null.
+- Return ONLY the JSON object, no explanation.`
                 },
                 {
                     role: "user",
-                    content: `You are an AI system specialized in extracting structured data from driving licenses.
-
-Analyze the provided document text and extract key fields into a structured JSON format.
-
-IMPORTANT GUIDELINES:
-- Use field labels (e.g., "Name", "DOB", "License No.", "Date of Issue", etc.) as the primary source of truth.
-- Do NOT infer or merge values from nearby fields.
-- Do NOT include unrelated information (e.g., father's name, S/O, W/O, S/W/D) in the NAME field.
-- Extract only the value corresponding to the correct label.
-- If multiple similar fields exist, choose the most relevant official field.
-- Preserve spacing in names (e.g., "R D", not "RD").
-- Dates must be converted to ISO format: YYYY-MM-DD.
-- If a field is missing or unclear, return null.
-- Do not hallucinate or guess values.
-
-EXPECTED OUTPUT FORMAT (STRICT JSON ONLY):
-
-{
-  "NAME": null,
-  "LICENSE_NUMBER": null,
-  "DATE_OF_BIRTH": null,
-  "ISSUE_DATE": null,
-  "EXPIRY_DATE": null,
-  "ADDRESS": null,
-  "VEHICLE_CLASS": null,
-  "ISSUING_AUTHORITY": null
-}
-
-FIELD DEFINITIONS:
-- NAME: Value explicitly labeled as "Name"
-- LICENSE_NUMBER: Value labeled as "License No." or similar
-- DATE_OF_BIRTH: Value labeled as "DOB" or "Date of Birth"
-- ISSUE_DATE: Value labeled as "Date of Issue"
-- EXPIRY_DATE: Value labeled as "Date of Expiry"
-- ADDRESS: Prefer "Present Address" or full address block
-- VEHICLE_CLASS: Value under "Authorization to Drive"
-- ISSUING_AUTHORITY: Authority issuing the license
-
-OUTPUT RULES:
-- Return ONLY valid JSON
-- No explanation, no extra text
-- No markdown formatting
-- No trailing commas
-
-DOCUMENT TEXT:
-${pdfText}
-                    `
+                    content: `TEXT:\n${rawText}`
                 }
-            ]
+            ],
+            response_format: { type: "json_object" }
         });
 
-        const output = response.choices[0].message.content;
-        const cleaned = output.replace(/```/g, '').trim();
+        let data = JSON.parse(response.choices[0].message.content);
 
-        let parsed;
-        try {
-            parsed = JSON.parse(cleaned);
-        } catch (err) {
-            return res.status(500).json({ error: "Invalid JSON from AI" });
-        }
+        // Apply regex fixes
+        data = applyLicenseRegexFixes(data, rawText);
 
-        res.json(parsed);
+        console.log("📤 Final License Data:", data);
+        res.json(data);
 
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Processing failed" });
+        console.error("❌ Fatal Error:", err.message);
+        res.status(500).json({ error: "Processing failed", details: err.message });
     }
 };
